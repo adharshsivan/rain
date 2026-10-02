@@ -1,0 +1,804 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<title>RainFX 3D demo</title>
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #05070d; font-family: system-ui, sans-serif; touch-action: none; -webkit-user-select: none; user-select: none; }
+  #wrap { position: fixed; inset: 0; }
+  #game { position: absolute; inset: 0; width: 100%; height: 100%; display: block; touch-action: none; }
+  #ui {
+    position: fixed; left: 10px; right: 10px; top: calc(10px + env(safe-area-inset-top));
+    z-index: 50; max-width: 340px; padding: 8px 12px; border-radius: 12px;
+    background: rgba(10, 14, 24, 0.55); color: #cfe0ff; font-size: 13px;
+    backdrop-filter: blur(6px); -webkit-backdrop-filter: blur(6px);
+  }
+  #ui label { display: flex; align-items: center; gap: 8px; margin: 5px 0; }
+  #ui label span { width: 52px; opacity: .8; }
+  #ui input[type=range] { flex: 1; }
+  #ui .row { display: flex; gap: 12px; flex-wrap: wrap; align-items: center; margin-top: 2px; }
+  #ui .row label { margin: 2px 0; }
+  #ui button { background: rgba(120,160,255,.18); color: #cfe0ff; border: 1px solid rgba(160,190,255,.3); border-radius: 8px; padding: 3px 10px; font-size: 12px; }
+  #fps { position: fixed; right: 10px; bottom: 8px; z-index: 50; color: #7f93b8; font-size: 11px; }
+  #hint { position: fixed; left: 0; right: 0; bottom: 22px; text-align: center; z-index: 50; color: #8da2c8; font-size: 12px; pointer-events: none; transition: opacity 1s; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="game"></canvas></div>
+
+<div id="ui">
+  <label><span>Rain</span><input id="int" type="range" min="0" max="1" step="0.01" value="0.75"></label>
+  <label><span>Wind</span><input id="wind" type="range" min="-1" max="1" step="0.01" value="0.25"></label>
+  <label><span>Glass</span><input id="glass" type="range" min="0" max="1" step="0.01" value="0.6"></label>
+  <div class="row">
+    <label><input id="rf" type="checkbox" checked> Refraction</label>
+    <label><input id="sp" type="checkbox" checked> Splashes</label>
+    <button id="gyro" type="button">Gyro</button>
+  </div>
+</div>
+<div id="hint">drag to look around &middot; try looking up</div>
+<div id="fps"></div>
+
+<script>
+/*!
+ * RainFX 2.0 — 3D rain + subtle glass water for web / mobile games.
+ * Canvas 2D, zero dependencies, pooled typed arrays (no per-frame allocation).
+ *
+ * Rain is simulated in real 3D around the camera and projected with perspective,
+ * so when you look up the streaks converge overhead, and when you turn the
+ * camera the rain stays put in the world.
+ *
+ *   const rain = new RainFX({ parent: gameWrap, refraction: { source: gameCanvas } });
+ *
+ *   // every frame (or let it run itself with autoStart:true):
+ *   rain.setCamera({ yaw: camYawDeg, pitch: camPitchDeg });   // degrees, pitch + = look up
+ *   rain.update(dt); rain.render();
+ *
+ *   rain.setIntensity(0.8);  rain.setWind(-0.3);  rain.opts.glassAmount = 0.4;
+ */
+(function (root, factory) {
+  if (typeof module === 'object' && module.exports) module.exports = factory();
+  else root.RainFX = factory();
+})(typeof self !== 'undefined' ? self : this, function () {
+  'use strict';
+
+  const TAU = Math.PI * 2, DEG = Math.PI / 180;
+  const rnd = Math.random;
+  const rand = (a, b) => a + (b - a) * rnd();
+  const clamp = (v, a, b) => (v < a ? a : v > b ? b : v);
+
+  const DEFAULTS = {
+    parent: null,           // element for the overlay canvas (default: document.body)
+    canvas: null,           // or your own <canvas> (sized by CSS)
+    zIndex: 10,
+
+    // --- rain (3D) ---
+    rain: true,
+    intensity: 0.7,         // 0..1
+    wind: 0.25,             // -1..1  (world +X / -X, about 5 m/s at 1)
+    speed: 10,              // fall speed, m/s
+    camera: { yaw: 0, pitch: 0, fov: 70 }, // degrees; fov is vertical
+    cameraHeight: 1.7,      // metres above the ground (ground splashes sit here)
+    radius: 7,              // rain volume radius around the camera, m
+    height: 10,             // rain volume height above the camera, m
+    color: '205,222,255',   // "r,g,b"
+    rainAlpha: 1,
+    splashes: true,         // ripples on the ground plane
+
+    // --- glass ---
+    glass: true,
+    glassAmount: 0.6,       // 0..1  how wet the glass is (live-adjustable)
+    glassScale: 1,          // droplet size multiplier
+    glassOpacity: 1,        // shading strength
+    refraction: null,       // { source: <canvas>, zoom: 2.4 } droplets show a flipped mini-view of your scene
+
+    tint: 'rgba(6,12,24,0.10)', // CSS background of the overlay, null for none
+    maxDPR: 1.5,
+    autoStart: true,
+    pauseWhenHidden: true
+  };
+
+  // distance bins (squared metres) -> far-to-near fade, so the volume edge never pops
+  const BINS = [
+    { d2: 3.24, w: 2.0, a: 0.20 },   // < 1.8 m  (out of focus, softer)
+    { d2: 12.25, w: 1.5, a: 0.34 },  // < 3.5 m
+    { d2: 36, w: 1.1, a: 0.28 },     // < 6 m
+    { d2: 81, w: 0.85, a: 0.18 },    // < 9 m
+    { d2: 121, w: 0.65, a: 0.09 },   // < 11 m
+    { d2: 1e9, w: 0.55, a: 0.04 }    // rest
+  ];
+  const NEAR = 0.4;       // near clip, m
+  const SHUTTER = 0.03;   // seconds of motion blur per streak
+
+  // Small, soft water bead: faint lens darkening at the rim, light pooled at the bottom, tiny highlight.
+  function makeDropSprite() {
+    const S = 96, m = S / 2;
+    const c = document.createElement('canvas');
+    c.width = c.height = S;
+    const g = c.getContext('2d');
+
+    g.save();
+    g.beginPath(); g.arc(m, m, m - 2, 0, TAU); g.clip();
+    let gr = g.createRadialGradient(m, m, m * 0.45, m, m, m);
+    gr.addColorStop(0, 'rgba(0,0,0,0)');
+    gr.addColorStop(0.75, 'rgba(0,8,20,0.10)');
+    gr.addColorStop(1, 'rgba(0,6,16,0.38)');
+    g.fillStyle = gr; g.fillRect(0, 0, S, S);
+
+    gr = g.createLinearGradient(0, 0, 0, S);          // top a touch darker, bottom a touch lighter
+    gr.addColorStop(0, 'rgba(0,10,25,0.16)');
+    gr.addColorStop(0.5, 'rgba(0,0,0,0)');
+    gr.addColorStop(1, 'rgba(255,255,255,0.07)');
+    g.fillStyle = gr; g.fillRect(0, 0, S, S);
+
+    gr = g.createRadialGradient(m, S * 0.78, 0, m, S * 0.78, S * 0.30);
+    gr.addColorStop(0, 'rgba(255,255,255,0.26)');
+    gr.addColorStop(1, 'rgba(255,255,255,0)');
+    g.fillStyle = gr; g.fillRect(0, 0, S, S);
+    g.restore();
+
+    g.strokeStyle = 'rgba(255,255,255,0.14)';
+    g.lineWidth = 2;
+    g.beginPath(); g.arc(m, m, m - 3, Math.PI * 0.1, Math.PI * 0.5); g.stroke();
+
+    g.fillStyle = 'rgba(255,255,255,0.65)';
+    g.beginPath(); g.ellipse(S * 0.35, S * 0.27, S * 0.07, S * 0.04, -0.7, 0, TAU); g.fill();
+    return c;
+  }
+
+  class RainFX {
+    constructor(opts) {
+      const o = (this.opts = Object.assign({}, DEFAULTS, opts));
+      o.camera = Object.assign({}, DEFAULTS.camera, (opts && opts.camera) || {});
+      this.parent = o.parent || document.body;
+      this.ownsCanvas = !o.canvas;
+      this.canvas = o.canvas || document.createElement('canvas');
+      if (this.ownsCanvas) {
+        const s = this.canvas.style;
+        s.position = this.parent === document.body ? 'fixed' : 'absolute';
+        s.left = '0'; s.top = '0'; s.width = '100%'; s.height = '100%';
+        s.zIndex = o.zIndex;
+        this.parent.appendChild(this.canvas);
+      }
+      this.canvas.style.pointerEvents = 'none'; // never block game input
+      if (o.tint) this.canvas.style.background = o.tint;
+      this.ctx = this.canvas.getContext('2d');
+
+      this.intensity = this.target = clamp(o.intensity, 0, 1);
+      this.wind = o.wind;
+      this.ground = -o.cameraHeight;
+      this._t = 0;
+      this._vx = this.wind * 5;
+      this._vz = 0;
+      this.refr = o.refraction || null;
+      this.sprite = makeDropSprite();
+      this.drops = [];
+      this.splashes = [];
+      this._spawnAcc = 0;
+      this._staticN = 0;
+      this.running = false;
+      this._wantRun = false;
+      this.w = this.h = this.dpr = 0;
+      this.setCamera(o.camera);
+
+      this._onResize = () => this.resize();
+      this._onVis = () => {
+        if (!this.opts.pauseWhenHidden) return;
+        if (document.hidden) this._halt();
+        else if (this._wantRun) this._go();
+      };
+      this._tick = (t) => {
+        if (!this.running) return;
+        const dt = Math.min(0.05, (t - this._last) / 1000 || 0.016);
+        this._last = t;
+        this.update(dt);
+        this.render();
+        this._raf = requestAnimationFrame(this._tick);
+      };
+
+      window.addEventListener('resize', this._onResize);
+      window.addEventListener('orientationchange', this._onResize);
+      document.addEventListener('visibilitychange', this._onVis);
+      if (typeof ResizeObserver !== 'undefined') {
+        this._ro = new ResizeObserver(this._onResize);
+        this._ro.observe(this.canvas);
+      }
+
+      this.resize(true);
+      this._seedGlass();
+      if (o.autoStart) this.start();
+    }
+
+    /* ---------- public API ---------- */
+    start() { this._wantRun = true; if (!document.hidden) this._go(); }
+    stop() { this._wantRun = false; this._halt(); }
+    setIntensity(v, instant) { this.target = clamp(v, 0, 1); if (instant) this.intensity = this.target; }
+    setWind(v) { this.wind = clamp(v, -1, 1); }
+    setColor(rgb) { this.opts.color = rgb; }
+    setRefractionSource(canvas, zoom) { this.refr = canvas ? { source: canvas, zoom: zoom || 2.4 } : null; }
+
+    /** degrees. yaw: turn right +, pitch: look up +, fov: vertical field of view */
+    setCamera(c) {
+      const cam = this.opts.camera;
+      if (c.yaw != null) cam.yaw = c.yaw;
+      if (c.pitch != null) cam.pitch = clamp(c.pitch, -89, 89);
+      if (c.fov != null) cam.fov = clamp(c.fov, 30, 120);
+    }
+
+    destroy() {
+      this.stop();
+      window.removeEventListener('resize', this._onResize);
+      window.removeEventListener('orientationchange', this._onResize);
+      document.removeEventListener('visibilitychange', this._onVis);
+      if (this._ro) this._ro.disconnect();
+      if (this.ownsCanvas && this.canvas.parentNode) this.canvas.parentNode.removeChild(this.canvas);
+    }
+
+    resize(force) {
+      const c = this.canvas, r = c.getBoundingClientRect();
+      const w = Math.max(1, r.width || window.innerWidth);
+      const h = Math.max(1, r.height || window.innerHeight);
+      const dpr = Math.min(window.devicePixelRatio || 1, this.opts.maxDPR);
+      if (!force && w === this.w && h === this.h && dpr === this.dpr) return;
+
+      const ow = this.w, oh = this.h;
+      this.w = w; this.h = h; this.dpr = dpr;
+      c.width = Math.round(w * dpr);
+      c.height = Math.round(h * dpr);
+      this.ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+
+      this.gs = clamp(Math.min(w, h) / 390, 0.85, 1.4) * this.opts.glassScale;
+      const area = clamp((w * h) / (390 * 844), 0.6, 1.8);
+      this.maxRain = Math.round(4200 * area);
+      this.maxGlass = Math.round(45 * area);
+
+      const n = this.maxRain;
+      this.X = new Float32Array(n); this.Y = new Float32Array(n); this.Z = new Float32Array(n);
+      this.V = new Float32Array(n);
+      this.P0x = new Float32Array(n); this.P0y = new Float32Array(n);
+      this.P1x = new Float32Array(n); this.P1y = new Float32Array(n);
+      this.BIN = new Uint8Array(n);
+      for (let i = 0; i < n; i++) this._respawn(i, true);
+
+      if (ow && oh) {
+        const sx = w / ow, sy = h / oh;
+        for (const d of this.drops) { d.x *= sx; d.y *= sy; }
+      }
+    }
+
+    /* ---------- loop ---------- */
+    _go() {
+      if (this.running) return;
+      this.running = true;
+      this._last = performance.now();
+      this._raf = requestAnimationFrame(this._tick);
+    }
+    _halt() { this.running = false; cancelAnimationFrame(this._raf); }
+
+    update(dt) {
+      dt = Math.min(dt, 0.05);
+      this._t += dt;
+      this.intensity += (this.target - this.intensity) * Math.min(1, dt * 2);
+      // gusty wind
+      const t = this._t;
+      this._vx = this.wind * 5 * (1 + 0.25 * Math.sin(t * 0.6) + 0.15 * Math.sin(t * 1.7 + 1));
+      this._vz = this.wind * 1.2 * Math.sin(t * 0.43);
+      if (this.opts.rain) this._updateRain(dt);
+      if (this.opts.splashes) this._updateSplashes(dt);
+      if (this.opts.glass) this._updateGlass(dt);
+    }
+
+    render() {
+      const ctx = this.ctx;
+      ctx.clearRect(0, 0, this.w, this.h);
+      this._prepCamera();
+      if (this.opts.rain) this._renderRain(ctx);
+      if (this.opts.splashes) this._renderSplashes(ctx);
+      if (this.opts.glass) this._renderGlass(ctx);
+    }
+
+    /* ---------- 3D camera ---------- */
+    _prepCamera() {
+      const cam = this.opts.camera;
+      const yaw = cam.yaw * DEG, pitch = cam.pitch * DEG;
+      const sy = Math.sin(yaw), cy = Math.cos(yaw), sp = Math.sin(pitch), cp = Math.cos(pitch);
+      this._fx = sy * cp; this._fy = sp; this._fz = cy * cp;          // forward
+      this._rx = cy; this._rz = -sy;                                   // right (y = 0)
+      this._ux = -sy * sp; this._uy = cp; this._uz = -cy * sp;        // up
+      this._F = (this.h * 0.5) / Math.tan(cam.fov * DEG * 0.5);
+      this._cx0 = this.w * 0.5; this._cy0 = this.h * 0.5;
+    }
+    // project a camera-relative point; sets this._sx/_sy and returns view depth
+    _proj(x, y, z) {
+      const cz = x * this._fx + y * this._fy + z * this._fz;
+      if (cz > NEAR) {
+        this._sx = this._cx0 + ((x * this._rx + z * this._rz) / cz) * this._F;
+        this._sy = this._cy0 - ((x * this._ux + y * this._uy + z * this._uz) / cz) * this._F;
+      }
+      return cz;
+    }
+
+    /* ---------- rain (3D) ---------- */
+    _respawn(i, initial) {
+      const o = this.opts, R = o.radius, top = o.height, g = this.ground;
+      const v = rand(0.85, 1.15);
+      const vy = o.speed * v;
+      const a = rnd() * TAU, r = R * Math.pow(rnd(), 0.65); // a bit denser near the camera
+      const span = top - g;
+      // spawn upwind so drift keeps the cloud centred on the camera
+      let x = Math.cos(a) * r - (this._vx * span) / (2 * vy);
+      let z = Math.sin(a) * r - (this._vz * span) / (2 * vy);
+      let y = top;
+      if (initial) {
+        y = g + rnd() * span;
+        const t = (top - y) / vy;
+        x += this._vx * t; z += this._vz * t;
+      }
+      this.X[i] = x; this.Y[i] = y; this.Z[i] = z; this.V[i] = v;
+    }
+
+    _updateRain(dt) {
+      const n = Math.floor(this.maxRain * this.intensity);
+      const X = this.X, Y = this.Y, Z = this.Z, V = this.V;
+      const sp = this.opts.speed, vx = this._vx, vz = this._vz, g = this.ground;
+      const R2 = this.opts.radius * this.opts.radius;
+      const splash = this.opts.splashes;
+      for (let i = 0; i < n; i++) {
+        Y[i] -= sp * V[i] * dt;
+        X[i] += vx * dt;
+        Z[i] += vz * dt;
+        if (Y[i] < g) {
+          if (splash && rnd() < 0.1) {
+            const d2 = X[i] * X[i] + Z[i] * Z[i];
+            if (d2 < 49) this._addSplash(X[i], Z[i]);
+          }
+          this._respawn(i, false);
+        } else if (X[i] * X[i] + Z[i] * Z[i] > R2) {
+          this._respawn(i, false);
+        }
+      }
+    }
+
+    _renderRain(ctx) {
+      const n = Math.floor(this.maxRain * this.intensity);
+      if (!n) return;
+      const X = this.X, Y = this.Y, Z = this.Z, V = this.V;
+      const P0x = this.P0x, P0y = this.P0y, P1x = this.P1x, P1y = this.P1y, BIN = this.BIN;
+      const fx = this._fx, fy = this._fy, fz = this._fz, rx = this._rx, rz = this._rz;
+      const ux = this._ux, uy = this._uy, uz = this._uz, F = this._F, cx0 = this._cx0, cy0 = this._cy0;
+      const w = this.w, h = this.h, sp = this.opts.speed, vx = this._vx, vz = this._vz;
+      const MAXL = 0.14 * h, MAXL2 = MAXL * MAXL;
+
+      for (let i = 0; i < n; i++) {
+        const x = X[i], y = Y[i], z = Z[i];
+        const cz = x * fx + y * fy + z * fz;
+        if (cz < NEAR) { BIN[i] = 255; continue; }
+        const tx = x - vx * SHUTTER, ty = y + sp * V[i] * SHUTTER, tz = z - vz * SHUTTER;
+        const tcz = tx * fx + ty * fy + tz * fz;
+        if (tcz < NEAR) { BIN[i] = 255; continue; }
+
+        const px = cx0 + ((x * rx + z * rz) / cz) * F;
+        const py = cy0 - ((x * ux + y * uy + z * uz) / cz) * F;
+        let qx = cx0 + ((tx * rx + tz * rz) / tcz) * F;
+        let qy = cy0 - ((tx * ux + ty * uy + tz * uz) / tcz) * F;
+
+        if ((px < 0 && qx < 0) || (px > w && qx > w) || (py < 0 && qy < 0) || (py > h && qy > h)) { BIN[i] = 255; continue; }
+
+        const dx = qx - px, dy = qy - py, l2 = dx * dx + dy * dy;
+        if (l2 > MAXL2) { const k = MAXL / Math.sqrt(l2); qx = px + dx * k; qy = py + dy * k; }
+
+        P0x[i] = px; P0y[i] = py; P1x[i] = qx; P1y[i] = qy;
+        const d2 = x * x + y * y + z * z;
+        BIN[i] = d2 < 3.24 ? 0 : d2 < 12.25 ? 1 : d2 < 36 ? 2 : d2 < 81 ? 3 : d2 < 121 ? 4 : 5;
+      }
+
+      const hs = clamp(h / 844, 0.8, 1.4), ra = this.opts.rainAlpha, rgb = this.opts.color;
+      ctx.lineCap = 'round';
+      for (let b = 0; b < BINS.length; b++) {
+        ctx.lineWidth = BINS[b].w * hs;
+        ctx.strokeStyle = 'rgba(' + rgb + ',' + (BINS[b].a * ra) + ')';
+        ctx.beginPath();
+        for (let i = 0; i < n; i++) {
+          if (BIN[i] !== b) continue;
+          ctx.moveTo(P0x[i], P0y[i]);
+          ctx.lineTo(P1x[i], P1y[i]);
+        }
+        ctx.stroke();
+      }
+    }
+
+    /* ---------- ground splashes (rings on the ground plane, in perspective) ---------- */
+    _addSplash(x, z) {
+      if (this.splashes.length >= 40) return;
+      this.splashes.push({ x: x, z: z, age: 0, life: rand(0.3, 0.5) });
+    }
+    _updateSplashes(dt) {
+      const s = this.splashes;
+      for (let i = s.length - 1; i >= 0; i--) {
+        s[i].age += dt;
+        if (s[i].age >= s[i].life) { s[i] = s[s.length - 1]; s.pop(); }
+      }
+    }
+    _renderSplashes(ctx) {
+      const s = this.splashes;
+      if (!s.length) return;
+      const g = this.ground, E = 0.1;
+      ctx.strokeStyle = 'rgb(' + this.opts.color + ')';
+      for (let i = 0; i < s.length; i++) {
+        const p = s[i], t = p.age / p.life;
+        const cz = this._proj(p.x, g, p.z);
+        if (cz < NEAR) continue;
+        const cx = this._sx, cy = this._sy;
+        if (cx < -40 || cx > this.w + 40 || cy < -40 || cy > this.h + 40) continue;
+        if (this._proj(p.x + E, g, p.z) < NEAR) continue;
+        const ax = (this._sx - cx) / E, ay = (this._sy - cy) / E;
+        if (this._proj(p.x, g, p.z + E) < NEAR) continue;
+        const bx = (this._sx - cx) / E, by = (this._sy - cy) / E;
+        const scale = Math.sqrt(Math.abs(ax * by - ay * bx)); // px per metre
+        if (scale < 1) continue;
+        const d = Math.sqrt(p.x * p.x + p.z * p.z);
+        ctx.save();
+        ctx.transform(ax, ay, bx, by, cx, cy);
+        ctx.globalAlpha = (1 - t) * 0.4 * clamp(1.15 - d / 7, 0, 1);
+        ctx.lineWidth = 1 / scale;
+        ctx.beginPath();
+        ctx.arc(0, 0, 0.04 + 0.2 * t, 0, TAU);
+        ctx.stroke();
+        ctx.restore();
+      }
+      ctx.globalAlpha = 1;
+    }
+
+    /* ---------- glass droplets (subtle) ---------- */
+    _newDrop(x, y, r, a) {
+      return {
+        x: x, y: y, r: r, a: a,
+        grow: rand(0.12, 0.4) * this.gs,
+        slideR: rand(4.2, 6.5) * this.gs,
+        sliding: false, moving: false, t: 0,
+        vy: 0, vT: 0, drift: 0, acc: 0, stretch: 1, dead: false
+      };
+    }
+
+    _seedGlass() {
+      this.drops.length = 0;
+      const n = Math.floor(this.maxGlass * 0.5 * this.intensity * this.opts.glassAmount);
+      for (let i = 0; i < n; i++) {
+        this.drops.push(this._newDrop(rnd() * this.w, rnd() * this.h, rand(0.8, 3) * this.gs, 1));
+      }
+    }
+
+    _updateGlass(dt) {
+      const gs = this.gs, I = this.intensity, drops = this.drops, h = this.h;
+      const amt = clamp(this.opts.glassAmount, 0, 1);
+      const wet = I > 0.05 && amt > 0.02;
+      const maxStatic = Math.floor(this.maxGlass * (0.35 + 0.65 * I) * amt);
+
+      this._spawnAcc += wet ? dt * (0.5 + 3.5 * I) * amt : 0;
+      while (this._spawnAcc >= 1) {
+        this._spawnAcc -= 1;
+        if (this._staticN < maxStatic) {
+          const r = (rnd() < 0.06 ? rand(2.5, 4) : rand(0.8, 2.2)) * gs;
+          drops.push(this._newDrop(rnd() * this.w, rnd() * h, r, 0));
+        }
+      }
+
+      let staticN = 0;
+      for (let k = 0; k < drops.length; k++) {
+        const d = drops[k];
+        if (d.dead) continue;
+        d.a = wet ? Math.min(1, d.a + dt * 1.5) : d.a - dt * 0.25;
+        if (d.a <= 0) { d.dead = true; continue; }
+
+        if (!d.sliding) {
+          staticN++;
+          d.r += d.grow * dt * (0.2 + I) * amt;
+          if (d.r > d.slideR) {
+            d.sliding = true; d.moving = true; d.t = rand(0.2, 0.6);
+            d.vT = rand(70, 200) * gs * clamp(d.r / (5.5 * gs), 0.7, 1.4);
+            d.drift = rand(-4, 4) * gs;
+          }
+          continue;
+        }
+
+        d.t -= dt;
+        if (d.t <= 0) {
+          d.moving = !d.moving;
+          d.t = d.moving ? rand(0.25, 0.8) : rand(0.1, 0.5);
+        }
+        const tv = d.moving ? d.vT : 6 * gs;
+        d.vy += (tv - d.vy) * Math.min(1, dt * 7);
+        const dy = d.vy * dt;
+        d.y += dy;
+        d.x += d.drift * dt;
+        d.acc += dy;
+        d.r -= dy * 0.0032;
+        d.stretch = 1 + Math.min(0.4, d.vy / (450 * gs));
+
+        if (d.acc > d.r * 2.8 + 5 * gs) {
+          d.acc = 0;
+          if (this._staticN < maxStatic) {
+            const tr = Math.min(d.r * 0.3, rand(0.7, 1.6) * gs);
+            drops.push(this._newDrop(d.x + rand(-0.3, 0.3) * d.r, d.y - d.r * d.stretch, tr, 0.5));
+          }
+        }
+
+        const rr = d.r * d.r * 0.8;
+        for (let j = 0; j < drops.length; j++) {
+          const o = drops[j];
+          if (o === d || o.sliding || o.dead) continue;
+          const ex = o.x - d.x, ey = o.y - d.y;
+          if (ex * ex + ey * ey < rr) {
+            d.r = Math.min(Math.sqrt(d.r * d.r + o.r * o.r * 0.7), 7 * gs);
+            o.dead = true;
+          }
+        }
+
+        if (d.y - d.r * 2 > h || d.r < 1.0 * gs) d.dead = true;
+      }
+      this._staticN = staticN;
+
+      let w = 0;
+      for (let r = 0; r < drops.length; r++) if (!drops[r].dead) drops[w++] = drops[r];
+      drops.length = w;
+    }
+
+    _renderGlass(ctx) {
+      const drops = this.drops, sp = this.sprite, gs = this.gs;
+      const src = this.refr && this.refr.source;
+      const zoom = (this.refr && this.refr.zoom) || 2.4;
+      const kx = src ? src.width / this.w : 1, ky = src ? src.height / this.h : 1;
+      const op = this.opts.glassOpacity;
+      let budget = 50;
+
+      for (let i = 0; i < drops.length; i++) {
+        const d = drops[i], r = d.r;
+        if (r < 0.5) continue;
+        const st = d.sliding ? d.stretch : 1;
+        const rx = r, ry = r * st;
+
+        if (d.sliding && d.vy > 20 * gs) { // faint wet trail
+          ctx.globalAlpha = d.a * 0.45;
+          ctx.strokeStyle = 'rgba(255,255,255,0.07)';
+          ctx.lineCap = 'round';
+          ctx.lineWidth = r * 0.5;
+          ctx.beginPath();
+          ctx.moveTo(d.x, d.y - ry * 0.5);
+          ctx.lineTo(d.x, d.y - ry - Math.min(d.vy * 0.07, 24 * gs));
+          ctx.stroke();
+        }
+
+        if (src && r > 2.2 * gs && budget > 0) { // refraction: flipped mini-view
+          budget--;
+          ctx.save();
+          ctx.beginPath(); ctx.ellipse(d.x, d.y, rx, ry, 0, 0, TAU); ctx.clip();
+          ctx.globalAlpha = d.a;
+          ctx.translate(d.x, d.y);
+          ctx.scale(-1, -1);
+          ctx.drawImage(
+            src,
+            (d.x - rx * zoom) * kx, (d.y - ry * zoom) * ky, rx * 2 * zoom * kx, ry * 2 * zoom * ky,
+            -rx, -ry, rx * 2, ry * 2
+          );
+          ctx.restore();
+        }
+
+        ctx.globalAlpha = d.a * op;
+        ctx.drawImage(sp, d.x - rx, d.y - ry, rx * 2, ry * 2);
+      }
+      ctx.globalAlpha = 1;
+    }
+  }
+
+  return RainFX;
+});
+
+</script>
+
+<script>
+(function () {
+  const TAU = Math.PI * 2, DEG = Math.PI / 180;
+  const FOV = 70;
+  const game = document.getElementById('game');
+  const g = game.getContext('2d');
+  let W, H, DPR;
+
+  function fit() {
+    DPR = Math.min(window.devicePixelRatio || 1, 2);
+    W = innerWidth; H = innerHeight;
+    game.width = Math.round(W * DPR); game.height = Math.round(H * DPR);
+    g.setTransform(DPR, 0, 0, DPR, 0, 0);
+  }
+  fit();
+  addEventListener('resize', fit);
+
+  // ---------- a 360 degree night-city panorama (stand-in for your 3D scene) ----------
+  const PP = 360;                                 // panorama pixels per radian
+  const PAN_W = Math.round(TAU * PP);
+  const TOP = Math.PI / 2, BOT = -70 * DEG;       // vertical coverage
+  const PAN_H = Math.round((TOP - BOT) * PP);
+  const yOf = (deg) => (TOP - deg * DEG) * PP;
+  const SKY_TOP = '#04070f';
+
+  function buildPano() {
+    const c = document.createElement('canvas');
+    c.width = PAN_W; c.height = PAN_H;
+    const p = c.getContext('2d');
+    const yH = yOf(0);
+    const R = (a, b) => a + Math.random() * (b - a);
+
+    let gr = p.createLinearGradient(0, 0, 0, yH);
+    gr.addColorStop(0, SKY_TOP); gr.addColorStop(0.55, '#0c1730'); gr.addColorStop(0.9, '#22304f'); gr.addColorStop(1, '#3a3a58');
+    p.fillStyle = gr; p.fillRect(0, 0, PAN_W, yH);
+
+    gr = p.createLinearGradient(0, yH, 0, PAN_H);
+    gr.addColorStop(0, '#171b2e'); gr.addColorStop(1, '#05070c');
+    p.fillStyle = gr; p.fillRect(0, yH, PAN_W, PAN_H - yH);
+
+    // soft low clouds
+    for (let i = 0; i < 110; i++) {
+      const x = Math.random() * PAN_W, y = yOf(R(6, 78)), r = R(70, 240), a = R(0.035, 0.085);
+      for (const off of [0, PAN_W, -PAN_W]) {
+        const q = p.createRadialGradient(x + off, y, 0, x + off, y, r);
+        q.addColorStop(0, 'rgba(120,140,185,' + a + ')'); q.addColorStop(1, 'rgba(120,140,185,0)');
+        p.fillStyle = q; p.fillRect(x + off - r, y - r, r * 2, r * 2);
+      }
+    }
+
+    // skyline layers
+    const layers = [
+      { h0: 2, h1: 7, col: '#111c36', lit: 0.2 },
+      { h0: 3, h1: 11, col: '#0a1326', lit: 0.26 },
+      { h0: 2, h1: 15, col: '#050a14', lit: 0.3 }
+    ];
+    for (const L of layers) {
+      let x = 0;
+      while (x < PAN_W) {
+        const bw = Math.min(R(30, 80), PAN_W - x), bh = R(L.h0, L.h1) * DEG * PP;
+        p.fillStyle = L.col; p.fillRect(x, yH - bh, bw, bh);
+        for (let wy = yH - bh + 8; wy < yH - 8; wy += 11) {
+          for (let wx = x + 5; wx < x + bw - 6; wx += 9) {
+            if (Math.random() < L.lit) {
+              p.fillStyle = Math.random() < 0.8 ? 'rgba(255,205,120,' + R(0.3, 0.75) + ')' : 'rgba(130,200,255,0.55)';
+              p.fillRect(wx, wy, 4, 5);
+            }
+          }
+        }
+        x += bw + 1;
+      }
+    }
+
+    p.globalCompositeOperation = 'lighter';
+    // wet street reflections
+    for (let i = 0; i < 220; i++) {
+      const x = Math.random() * PAN_W, len = R(60, 260), w = R(2, 7);
+      const warm = Math.random() < 0.65;
+      const q = p.createLinearGradient(0, yH, 0, yH + len);
+      q.addColorStop(0, warm ? 'rgba(255,190,110,0.16)' : 'rgba(110,180,255,0.14)');
+      q.addColorStop(1, 'rgba(0,0,0,0)');
+      p.fillStyle = q; p.fillRect(x, yH, w, len);
+    }
+    // street lamps
+    const lamp = (yawRad, pitchDeg, rad, a) => {
+      const x = yawRad * PP, y = yOf(pitchDeg);
+      for (const off of [0, PAN_W, -PAN_W]) {
+        const q = p.createRadialGradient(x + off, y, 0, x + off, y, rad);
+        q.addColorStop(0, 'rgba(255,235,190,' + a + ')');
+        q.addColorStop(0.15, 'rgba(255,200,130,' + a * 0.5 + ')');
+        q.addColorStop(1, 'rgba(255,190,110,0)');
+        p.fillStyle = q; p.fillRect(x + off - rad, y - rad, rad * 2, rad * 2);
+      }
+    };
+    for (const yaw of [0.3, 1.35, 2.5, 3.8, 4.9, 5.7]) {
+      lamp(yaw, R(5, 9), 70, 0.9);
+      const x = yaw * PP;
+      p.fillStyle = 'rgba(255,200,130,0.09)'; p.fillRect(x - 2, yOf(7), 4, 140);
+    }
+    for (const yaw of [0.9, 3.0, 4.4, 5.9]) lamp(yaw, R(32, 58), 150, 0.55);
+    return c;
+  }
+  const pano = buildPano();
+
+  // ---------- camera: drag to look, optional gyro, idle tour until you touch it ----------
+  const cam = { yaw: 20, pitch: 6 };               // degrees
+  let yawV = 0, pitchV = 0, down = false, lx = 0, ly = 0, touched = false, tour = 0;
+  const PITCH_MIN = -30, PITCH_MAX = 55;
+
+  game.addEventListener('pointerdown', (e) => { down = true; touched = true; lx = e.clientX; ly = e.clientY; game.setPointerCapture(e.pointerId); document.getElementById('hint').style.opacity = 0; });
+  game.addEventListener('pointermove', (e) => {
+    if (!down) return;
+    const dx = e.clientX - lx, dy = e.clientY - ly; lx = e.clientX; ly = e.clientY;
+    const k = (FOV / H);                           // degrees per pixel: the world follows your finger
+    cam.yaw -= dx * k; cam.pitch += dy * k;
+    yawV = -dx * k * 60; pitchV = dy * k * 60;
+  });
+  const up = () => { down = false; };
+  game.addEventListener('pointerup', up); game.addEventListener('pointercancel', up);
+
+  let gyroOn = false;
+  function onOrient(e) {
+    if (e.beta == null) return;
+    cam.pitch = Math.max(PITCH_MIN, Math.min(PITCH_MAX, e.beta - 90));
+    if (e.alpha != null) cam.yaw = -e.alpha;
+  }
+  document.getElementById('gyro').onclick = async () => {
+    try {
+      if (!gyroOn) {
+        if (window.DeviceOrientationEvent && typeof DeviceOrientationEvent.requestPermission === 'function') {
+          const r = await DeviceOrientationEvent.requestPermission(); if (r !== 'granted') return;
+        }
+        addEventListener('deviceorientation', onOrient); gyroOn = true; touched = true;
+      } else { removeEventListener('deviceorientation', onOrient); gyroOn = false; }
+    } catch (err) { /* not supported */ }
+  };
+
+  // ---------- the rain: one constructor, camera + two calls per frame ----------
+  const rain = new RainFX({
+    parent: document.getElementById('wrap'),
+    autoStart: false,                              // we drive it from the game loop below
+    intensity: 0.75, wind: 0.25, glassAmount: 0.6,
+    camera: { fov: FOV },
+    refraction: { source: game, zoom: 2.4 }
+  });
+  window.rain = rain;
+
+  const $ = (id) => document.getElementById(id);
+  $('int').oninput = (e) => rain.setIntensity(+e.target.value);
+  $('wind').oninput = (e) => rain.setWind(+e.target.value);
+  $('glass').oninput = (e) => { rain.opts.glassAmount = +e.target.value; };
+  $('sp').onchange = (e) => { rain.opts.splashes = e.target.checked; };
+  $('rf').onchange = (e) => rain.setRefractionSource(e.target.checked ? game : null);
+
+  // ---------- main loop ----------
+  let last = performance.now(), fpsAcc = 0, fpsN = 0, flash = 0, nextFlash = 6 + Math.random() * 6, clock = 0;
+  function loop(t) {
+    const dt = Math.min(0.05, (t - last) / 1000); last = t; clock += dt;
+
+    if (!down && !gyroOn) {
+      if (!touched) {                              // gentle intro tour so you see the rain overhead
+        tour += dt;
+        cam.yaw += 5 * dt;
+        cam.pitch = 24 + 28 * Math.sin(tour * 0.28 - 1.2);
+      } else {
+        cam.yaw += yawV * dt; cam.pitch += pitchV * dt;
+        const f = Math.pow(0.04, dt); yawV *= f; pitchV *= f;
+      }
+    }
+    cam.pitch = Math.max(PITCH_MIN, Math.min(PITCH_MAX, cam.pitch));
+
+    // draw the panorama through the same camera the rain uses
+    const F = (H * 0.5) / Math.tan(FOV * DEG * 0.5), s = F / PP;
+    const yaw = ((cam.yaw * DEG) % TAU + TAU) % TAU;
+    const sw = W / s, sh = H / s;
+    const sx = yaw * PP - sw / 2, sy = (TOP - cam.pitch * DEG) * PP - sh / 2;
+    g.globalCompositeOperation = 'source-over';
+    g.fillStyle = SKY_TOP; g.fillRect(0, 0, W, H);
+    g.drawImage(pano, -sx * s, -sy * s, PAN_W * s, PAN_H * s);
+    if (sx < 0) g.drawImage(pano, (-sx - PAN_W) * s, -sy * s, PAN_W * s, PAN_H * s);
+    if (sx + sw > PAN_W) g.drawImage(pano, (-sx + PAN_W) * s, -sy * s, PAN_W * s, PAN_H * s);
+
+    // occasional far lightning
+    nextFlash -= dt;
+    if (nextFlash <= 0) { flash = 1; nextFlash = 7 + Math.random() * 9; }
+    if (flash > 0.01) {
+      g.globalCompositeOperation = 'lighter';
+      const fl = Math.abs(Math.sin(flash * 9)) * flash;
+      g.fillStyle = 'rgba(150,175,255,' + (fl * 0.22) + ')'; g.fillRect(0, 0, W, H);
+      flash *= Math.pow(0.02, dt);
+    }
+    g.globalCompositeOperation = 'source-over';
+
+    rain.setCamera({ yaw: cam.yaw, pitch: cam.pitch });
+    rain.update(dt);   // <-- 1
+    rain.render();     // <-- 2
+
+    fpsAcc += dt; fpsN++;
+    if (fpsAcc > 0.5) { $('fps').textContent = Math.round(fpsN / fpsAcc) + ' fps'; fpsAcc = 0; fpsN = 0; }
+    requestAnimationFrame(loop);
+  }
+  requestAnimationFrame(loop);
+})();
+</script>
+</body>
+</html>
